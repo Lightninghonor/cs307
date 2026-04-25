@@ -6,11 +6,12 @@ set search_path to flightdb, public;
 
 -- 订单主表：一次购票行为
 create table if not exists booking_order (
-    order_id    int generated always as identity primary key,
+    order_id     int generated always as identity primary key,
     passenger_id int not null references passenger(passenger_id) on update cascade,
     instance_id  int not null references flight_instance(instance_id) on update cascade,
     cabin_class  varchar(10) not null,
     order_time   timestamptz not null default now(),
+    contact_id   int,  -- 高级功能：为联系人订票时填入，普通订票为 NULL
     constraint ck_order_cabin check (cabin_class in ('economy', 'business'))
 );
 
