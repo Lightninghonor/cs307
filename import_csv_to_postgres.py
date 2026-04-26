@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import date, time
 from decimal import Decimal
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 import psycopg2
@@ -125,6 +126,40 @@ def detect_schema_layout(cursor, schema_name: str) -> SchemaLayout:
         passenger_last_name_column=passenger_last_name_column,
         flight_instance_date_column=flight_instance_date_column,
     )
+
+
+def resolve_schema_name(cursor, preferred_schema: str) -> str:
+    cursor.execute(
+        """
+        select table_schema
+        from information_schema.tables
+        where table_name in ('passenger', 'flight_instance')
+        group by table_schema
+        having count(distinct table_name) = 2
+        order by case when table_schema = %s then 0 else 1 end, table_schema
+        limit 1
+        """,
+        (preferred_schema,),
+    )
+    row = cursor.fetchone()
+    if row is not None:
+        return row[0]
+
+    cursor.execute(
+        """
+        select table_schema
+        from information_schema.tables
+        where table_name = 'flight_instance'
+        order by case when table_schema = %s then 0 else 1 end, table_schema
+        limit 1
+        """,
+        (preferred_schema,),
+    )
+    row = cursor.fetchone()
+    if row is not None:
+        return row[0]
+
+    return preferred_schema
 def prepare_region_rows(rows: list[dict[str, str]]) -> list[tuple[str, str | None]]:
     seen: set[str] = set()
     prepared: list[tuple[str, str | None]] = []
@@ -135,6 +170,37 @@ def prepare_region_rows(rows: list[dict[str, str]]) -> list[tuple[str, str | Non
         seen.add(name)
         prepared.append((name, normalize_code(row.get("code"))))
     return prepared
+
+
+def collect_extra_region_names(
+    airline_rows: list[dict[str, str]],
+    airport_rows: list[dict[str, str]],
+    ticket_rows: list[dict[str, str]],
+) -> set[str]:
+    extra_names: set[str] = set()
+
+    for row in airline_rows:
+        region_name = normalize_region_name(row.get("region"))
+        if region_name:
+            extra_names.add(region_name)
+
+    for row in airport_rows:
+        region_name = normalize_region_name(row.get("region"))
+        if region_name:
+            extra_names.add(region_name)
+
+    for row in ticket_rows:
+        source_region = normalize_region_name(row.get("source_region"))
+        destination_region = normalize_region_name(row.get("destination_region"))
+        airline_region = normalize_region_name(row.get("airline_region"))
+        if source_region:
+            extra_names.add(source_region)
+        if destination_region:
+            extra_names.add(destination_region)
+        if airline_region:
+            extra_names.add(airline_region)
+
+    return extra_names
 
 
 def infer_airport_name(city: str, code: str) -> str:
@@ -172,21 +238,52 @@ def split_full_name(full_name: str) -> tuple[str, str]:
     return " ".join(parts[:-1]), parts[-1]
 
 
-def load_database(url: str, schema_name: str, reset: bool) -> None:
-    data = {name: read_csv(path) for name, path in CSV_FILES.items()}
+def load_database(
+    url: str,
+    schema_name: str,
+    reset: bool,
+    tickets_file: Path | None = None,
+    page_size: int = 1000,
+    timing: bool = False,
+) -> None:
+    if page_size < 1:
+        raise ValueError("page_size must be >= 1")
 
-    region_rows = prepare_region_rows(data["region"])
+    active_csv_files = dict(CSV_FILES)
+    if tickets_file is not None:
+        active_csv_files["tickets"] = tickets_file
+
+    missing_files = [name for name, path in active_csv_files.items() if not path.exists()]
+    if missing_files:
+        raise FileNotFoundError(f"Missing required CSV files: {', '.join(missing_files)}")
+
+    stage_times: dict[str, float] = {}
+    t_all_start = perf_counter()
+
+    t_read_start = perf_counter()
+    data = {name: read_csv(path) for name, path in active_csv_files.items()}
+    stage_times["read_csv"] = perf_counter() - t_read_start
+
     airline_rows = data["airline"]
     airport_rows = data["airport"]
     passenger_rows = data["passenger"]
     ticket_rows = data["tickets"]
+    extra_region_names = collect_extra_region_names(airline_rows, airport_rows, ticket_rows)
+    region_rows = prepare_region_rows(data["region"])
+
+    existing_region_names = {name for name, _code in region_rows}
+    for region_name in sorted(extra_region_names - existing_region_names):
+        region_rows.append((region_name, None))
+
+    skip_counts: dict[str, int] = defaultdict(int)
 
     with psycopg2.connect(url) as connection:
         connection.autocommit = False
         with connection.cursor() as cursor:
-            cursor.execute(sql.SQL("set search_path to {}, public").format(sql.Identifier(schema_name)))
+            resolved_schema_name = resolve_schema_name(cursor, schema_name)
+            cursor.execute(sql.SQL("set search_path to {}, public").format(sql.Identifier(resolved_schema_name)))
 
-            layout = detect_schema_layout(cursor, schema_name)
+            layout = detect_schema_layout(cursor, resolved_schema_name)
 
             if reset:
                 cursor.execute(
@@ -211,7 +308,9 @@ def load_database(url: str, schema_name: str, reset: bool) -> None:
                     set code = excluded.code
                 returning region_id, name
             """
-            region_result = execute_values(cursor, region_sql, region_insert_rows, fetch=True, page_size=max(1, len(region_insert_rows)))
+            t_stage = perf_counter()
+            region_result = execute_values(cursor, region_sql, region_insert_rows, fetch=True, page_size=page_size)
+            stage_times["insert_region"] = perf_counter() - t_stage
             region_id_by_name = {name: region_id for region_id, name in region_result}
 
             airline_insert_rows = []
@@ -230,7 +329,9 @@ def load_database(url: str, schema_name: str, reset: bool) -> None:
                         region_id = excluded.region_id
                 returning airline_id, name, code
             """
-            airline_result = execute_values(cursor, airline_sql, airline_insert_rows, fetch=True, page_size=max(1, len(airline_insert_rows)))
+            t_stage = perf_counter()
+            airline_result = execute_values(cursor, airline_sql, airline_insert_rows, fetch=True, page_size=page_size)
+            stage_times["insert_airline"] = perf_counter() - t_stage
             airline_id_by_name = {name: airline_id for airline_id, name, _code in airline_result}
             airline_id_by_code = {code: airline_id for airline_id, _name, code in airline_result}
 
@@ -314,7 +415,9 @@ def load_database(url: str, schema_name: str, reset: bool) -> None:
                         region_id = excluded.region_id
                 returning airport_id, iata_code
             """
-            airport_result = execute_values(cursor, airport_sql, airport_insert_rows, fetch=True, page_size=max(1, len(airport_insert_rows)))
+            t_stage = perf_counter()
+            airport_result = execute_values(cursor, airport_sql, airport_insert_rows, fetch=True, page_size=page_size)
+            stage_times["insert_airport"] = perf_counter() - t_stage
             airport_id_by_code.update({code: airport_id for airport_id, code in airport_result})
 
             airport_info_sql = """
@@ -333,6 +436,7 @@ def load_database(url: str, schema_name: str, reset: bool) -> None:
             for code, latitude, longitude, altitude, timezone_offset, timezone_dst, timezone_region in airport_info_rows:
                 airport_id = airport_id_by_code.get(code)
                 if airport_id is None:
+                    skip_counts["airport_info_missing_airport_id"] += 1
                     continue
                 airport_info_insert_rows.append(
                     (
@@ -345,7 +449,9 @@ def load_database(url: str, schema_name: str, reset: bool) -> None:
                         normalize_null(timezone_region),
                     )
                 )
-            execute_values(cursor, airport_info_sql, airport_info_insert_rows, page_size=1000)
+            t_stage = perf_counter()
+            execute_values(cursor, airport_info_sql, airport_info_insert_rows, page_size=page_size)
+            stage_times["insert_airport_info"] = perf_counter() - t_stage
 
             passenger_insert_rows = []
             for row in passenger_rows:
@@ -384,7 +490,9 @@ def load_database(url: str, schema_name: str, reset: bool) -> None:
                             gender = excluded.gender,
                             mobile_number = excluded.mobile_number
                 """
-            execute_values(cursor, passenger_sql, passenger_insert_rows, page_size=1000)
+            t_stage = perf_counter()
+            execute_values(cursor, passenger_sql, passenger_insert_rows, page_size=page_size)
+            stage_times["insert_passenger"] = perf_counter() - t_stage
 
             route_rows = []
             route_key_to_source: dict[tuple[Any, ...], dict[str, str]] = {}
@@ -393,6 +501,7 @@ def load_database(url: str, schema_name: str, reset: bool) -> None:
                 airline_name = clean_text(row["airline_name"])
                 airline_id = airline_id_by_name.get(airline_name)
                 if airline_id is None:
+                    skip_counts["route_missing_airline"] += 1
                     continue
 
                 source_code = normalize_code(row["source_code"])
@@ -400,6 +509,7 @@ def load_database(url: str, schema_name: str, reset: bool) -> None:
                 source_airport_id = airport_id_by_code.get(source_code or "")
                 destination_airport_id = airport_id_by_code.get(destination_code or "")
                 if source_airport_id is None or destination_airport_id is None:
+                    skip_counts["route_missing_airport"] += 1
                     continue
 
                 departure_time_value, _departure_offset = parse_time_field(row["departure_time"])
@@ -428,7 +538,9 @@ def load_database(url: str, schema_name: str, reset: bool) -> None:
                 do update set flight_no = excluded.flight_no
                 returning route_id, flight_no, airline_id, source_airport_id, destination_airport_id, departure_time, arrival_time, arrival_day_offset
             """
-            route_result = execute_values(cursor, route_sql, route_rows, fetch=True, page_size=max(1, len(route_rows)))
+            t_stage = perf_counter()
+            route_result = execute_values(cursor, route_sql, route_rows, fetch=True, page_size=page_size)
+            stage_times["insert_route"] = perf_counter() - t_stage
             route_id_by_key = {
                 (
                     flight_no,
@@ -447,10 +559,12 @@ def load_database(url: str, schema_name: str, reset: bool) -> None:
                 flight_no = clean_text(row["number"]).upper()
                 airline_id = airline_id_by_name.get(clean_text(row["airline_name"]))
                 if airline_id is None:
+                    skip_counts["instance_missing_airline"] += 1
                     continue
                 source_airport_id = airport_id_by_code.get(normalize_code(row["source_code"]) or "")
                 destination_airport_id = airport_id_by_code.get(normalize_code(row["destination_code"]) or "")
                 if source_airport_id is None or destination_airport_id is None:
+                    skip_counts["instance_missing_airport"] += 1
                     continue
 
                 departure_time_value, _departure_offset = parse_time_field(row["departure_time"])
@@ -469,6 +583,7 @@ def load_database(url: str, schema_name: str, reset: bool) -> None:
                 )
                 route_id = route_id_by_key.get(route_key)
                 if route_id is None:
+                    skip_counts["instance_missing_route"] += 1
                     continue
 
                 instance_rows.append(
@@ -492,9 +607,13 @@ def load_database(url: str, schema_name: str, reset: bool) -> None:
                         economy_price = excluded.economy_price,
                         economy_remain = excluded.economy_remain
             """
-            execute_values(cursor, instance_sql, instance_rows, page_size=1000)
+            t_stage = perf_counter()
+            execute_values(cursor, instance_sql, instance_rows, page_size=page_size)
+            stage_times["insert_instance"] = perf_counter() - t_stage
 
         connection.commit()
+
+    stage_times["total"] = perf_counter() - t_all_start
 
     print("Import finished")
     print(f"Regions imported: {len(region_rows)}")
@@ -505,6 +624,14 @@ def load_database(url: str, schema_name: str, reset: bool) -> None:
     print(f"Flight instances imported: {len(instance_rows)}")
     if synthetic_airports:
         print("Synthetic airport codes added:", ", ".join(synthetic_airports))
+    if skip_counts:
+        print("Rows skipped during import:")
+        for reason, count in sorted(skip_counts.items()):
+            print(f"  - {reason}: {count}")
+    if timing:
+        print("Stage timings (seconds):")
+        for stage_name in sorted(stage_times.keys()):
+            print(f"  - {stage_name}: {stage_times[stage_name]:.3f}")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -517,6 +644,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--password", default=os.getenv("PGPASSWORD", ""))
     parser.add_argument("--schema", default=os.getenv("PGSCHEMA", "flightdb"))
     parser.add_argument("--reset", action="store_true", help="Truncate target tables before import")
+    parser.add_argument("--tickets-file", default=None, help="Optional custom tickets CSV path for volume tests")
+    parser.add_argument("--page-size", type=int, default=2000, help="Batch size for execute_values")
+    parser.add_argument("--timing", action="store_true", help="Print per-stage timing for Task 3.3 experiments")
     return parser
 
 
@@ -529,7 +659,19 @@ def main() -> None:
             f"host={args.host} port={args.port} dbname={args.dbname} "
             f"user={args.user} password={args.password}"
         )
-    load_database(dsn, args.schema, args.reset)
+    tickets_file = Path(args.tickets_file).resolve() if args.tickets_file else None
+    try:
+        load_database(
+            dsn,
+            args.schema,
+            args.reset,
+            tickets_file=tickets_file,
+            page_size=args.page_size,
+            timing=args.timing,
+        )
+    except Exception as exc:
+        print(f"Import failed: {exc}")
+        raise
 
 
 if __name__ == "__main__":
