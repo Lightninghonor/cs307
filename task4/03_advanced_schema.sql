@@ -17,3 +17,4 @@ CREATE TABLE IF NOT EXISTS contact (
 );
 
 CREATE INDEX IF NOT EXISTS idx_contact_owner ON contact(owner_id);
+

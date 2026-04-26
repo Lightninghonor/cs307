@@ -79,12 +79,8 @@ def test_fast_generate_correctness():
     print(f"  {INFO} 多线程跳过 {result['skipped']} 条（正确）")
 
 
-def test_fast_generate_performance():
-    """多线程生成速度快于单线程（30天范围）"""
-    start = date(2025, 4, 1)
-    end   = date(2025, 4, 30)
-
-    # 清理这段日期的数据
+def _clean_date_range(start: date, end: date):
+    """清理指定日期范围的 flight_instance，确保提交"""
     conn = db.get_conn()
     with conn.cursor() as cur:
         cur.execute(
@@ -92,28 +88,49 @@ def test_fast_generate_performance():
             (start, end)
         )
     db.commit()
+    # 关闭并重建连接，确保后续操作看到最新数据
+    db.close()
+    db.get_conn()
 
+
+def test_fast_generate_performance():
+    """多线程生成速度快于单线程（30天范围）"""
+    start = date(2025, 4, 1)
+    end   = date(2025, 4, 30)
+
+    _clean_date_range(start, end)
     t0 = time.perf_counter()
     r1 = gen.generate_instances(start, end)
     t1 = time.perf_counter()
     single_time = t1 - t0
 
-    # 清理再测多线程
-    with conn.cursor() as cur:
-        cur.execute(
-            "DELETE FROM flight_instance WHERE flight_date BETWEEN %s AND %s",
-            (start, end)
-        )
-    db.commit()
-
+    _clean_date_range(start, end)
     t0 = time.perf_counter()
     r2 = gen_fast.generate_instances_fast(start, end)
     t1 = time.perf_counter()
     multi_time = t1 - t0
 
-    assert r1["inserted"] == r2["inserted"], "两种方式插入数量应相同"
+    # 验证两种方式生成的实际行数一致（直接查库，不依赖 rowcount）
+    with db.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) FROM flight_instance WHERE flight_date BETWEEN %s AND %s",
+            (start, end)
+        )
+        count_after_multi = cur.fetchone()["count"]
+
+    _clean_date_range(start, end)
+    gen.generate_instances(start, end)
+    with db.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) FROM flight_instance WHERE flight_date BETWEEN %s AND %s",
+            (start, end)
+        )
+        count_after_single = cur.fetchone()["count"]
+
+    assert count_after_single == count_after_multi, \
+        f"两种方式生成行数应相同：单线程 {count_after_single} vs 多线程 {count_after_multi}"
     print(f"  {INFO} 单线程: {single_time:.2f}s  多线程: {multi_time:.2f}s  "
-          f"插入 {r2['inserted']} 条  线程数: {r2['workers']}")
+          f"生成 {count_after_multi} 条  线程数: {r2['workers']}")
 
 
 # ─────────────────────────────────────────────
